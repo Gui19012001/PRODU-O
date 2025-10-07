@@ -1,0 +1,7 @@
+streamlit
+pandas
+plotly
+pytz
+supabase-py
+python-dotenv
+opencv-python
