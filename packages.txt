@@ -1,1 +1,1 @@
-libgl1
+libgthread-2.0
