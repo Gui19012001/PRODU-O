@@ -1,7 +1,6 @@
 # ============================================================
-# NR-17 | ERGONOMIA POR VISÃO - MVP 04.1 TABLET / CLOUD
+# NR-17 | ERGONOMIA POR VISÃO - MVP 03 STANDALONE
 # Arquivo único: visão + RULA/REBA + evidências + PDF
-# Câmera otimizada para tablet: traseira, 16:9 e IA em resolução reduzida
 # ============================================================
 
 from pathlib import Path
@@ -288,6 +287,22 @@ import numpy as np
 import streamlit as st
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
+# ------------------------------------------------------------
+# FIX DE QUALIDADE DE VÍDEO (WebRTC/VP8)
+# Por padrão o aiortc trava o bitrate do codec VP8 em no máximo
+# 1.5 Mbps (com 500 kbps de partida). Para 720p/1080p com overlay
+# em movimento isso força uma compressão pesada e é a causa do
+# efeito "texturizado"/blocado no vídeo, independente da resolução
+# pedida em media_stream_constraints. Elevamos o teto para permitir
+# uma qualidade condizente com a resolução configurada.
+try:
+    import aiortc.codecs.vpx as _vpx_codec
+    _vpx_codec.DEFAULT_BITRATE = 2_500_000  # 2.5 Mbps
+    _vpx_codec.MIN_BITRATE = 1_000_000      # 1.0 Mbps
+    _vpx_codec.MAX_BITRATE = 6_000_000      # 6.0 Mbps
+except Exception:
+    pass
+
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -304,22 +319,6 @@ MODEL_URL = (
     "pose_landmarker/pose_landmarker_lite/float16/latest/"
     "pose_landmarker_lite.task"
 )
-
-
-# Perfis pensados para WebRTC/Streamlit Cloud.
-# A captura/evidência usa a resolução entregue pelo navegador.
-# O MediaPipe processa uma cópia reduzida para preservar FPS e estabilidade.
-CAMERA_PROFILES = {
-    "Industrial · 1280×720 · 30 FPS": {
-        "width": 1280, "height": 720, "fps": 30, "process_long_side": 960,
-    },
-    "Alta precisão · 1920×1080 · 24 FPS": {
-        "width": 1920, "height": 1080, "fps": 24, "process_long_side": 960,
-    },
-    "Econômica · 960×540 · 30 FPS": {
-        "width": 960, "height": 540, "fps": 30, "process_long_side": 640,
-    },
-}
 
 # Landmarks MediaPipe Pose
 L_EAR, R_EAR = 7, 8
@@ -1215,9 +1214,7 @@ def generate_nr17_pdf(
         ["Tempo válido / tempo descartado", f"{_fmt_seconds(snapshot.get('total_time',0))} / {_fmt_seconds(snapshot.get('invalid_time',0))}"],
         ["Cobertura corporal atual", f"{snapshot.get('coverage',0):.1f}%"],
         ["FPS estimado", f"{snapshot.get('fps',0):.1f}"],
-        ["Resolução recebida / solicitada", f"{snapshot.get('resolution','--')} / {snapshot.get('requested_resolution','--')}"],
-        ["Resolução usada pela IA", snapshot.get("processing_resolution","--")],
-        ["Orientação", snapshot.get("orientation","--")],
+        ["Resolução", snapshot.get("resolution","--")],
         ["Marcador alvo detectado", "SIM" if snapshot.get("marker_found") else ("N/A" if metadata.get("capture_mode") == "Visão normal" else "NÃO")],
     ]
     story += [_pdf_table(quality_rows, [88*mm,86*mm]), Spacer(1,4*mm)]
@@ -1406,11 +1403,6 @@ class ErgonomiaVideoProcessor:
         self.marker_id = int(self.cfg.get("marker_id",0))
         self.min_quality = float(self.cfg.get("min_quality",70))
         self.blur_face = bool(self.cfg.get("blur_face",True))
-        self.process_long_side = int(self.cfg.get("process_long_side",960))
-        self.requested_width = int(self.cfg.get("requested_width",1280))
-        self.requested_height = int(self.cfg.get("requested_height",720))
-        self.requested_fps = int(self.cfg.get("requested_fps",30))
-        self.camera_label = str(self.cfg.get("camera_label","Traseira"))
         self.rula_opts = dict(self.cfg.get("rula_opts", default_rula_opts()))
         self.reba_opts = dict(self.cfg.get("reba_opts", default_reba_opts()))
         self.lock = threading.RLock()
@@ -1502,10 +1494,6 @@ class ErgonomiaVideoProcessor:
                 "rula":0, "reba":0,
                 "quality":0.0, "coverage":0.0, "brightness":0.0,
                 "blur_score":0.0, "fps":0.0, "resolution":"--",
-                "processing_resolution":"--",
-                "requested_resolution":f"{self.requested_width}x{self.requested_height}",
-                "resolution_ok":False, "orientation":"--",
-                "camera_label":self.camera_label,
                 "marker_found":False, "marker_count":0,
             }
 
@@ -1604,45 +1592,25 @@ class ErgonomiaVideoProcessor:
 
     def _capture_quality(self, image, lm, marker_found):
         h,w = image.shape[:2]
-
-        # Nitidez/iluminação não precisam ser calculadas em Full HD.
-        # Isso reduz CPU sem alterar a resolução das evidências.
-        sample = image
-        long_side = max(h,w)
-        if long_side > 960:
-            scale = 960.0 / float(long_side)
-            sw = max(2, int(round(w*scale)))
-            sh = max(2, int(round(h*scale)))
-            sample = cv2.resize(image,(sw,sh),interpolation=cv2.INTER_AREA)
-
-        gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         brightness = float(np.mean(gray))
         blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
         visible_count = 0
+        vis_values = []
         for idx in QUALITY_LANDMARKS:
             obj = lm[idx]
             vis = float(getattr(obj,"visibility",1.0) or 0.0)
             pres = float(getattr(obj,"presence",1.0) or 0.0)
+            vis_values.append(min(vis,pres))
             if vis >= 0.45 and pres >= 0.45:
                 visible_count += 1
         coverage = 100.0 * visible_count / len(QUALITY_LANDMARKS)
 
+        # 100 em iluminação intermediária; cai em extremos.
         brightness_score = clamp(100.0 - abs(brightness - 130.0) * 0.95, 0, 100)
         blur_score = clamp(blur_var / 160.0 * 100.0, 0, 100)
-
-        req_w,req_h = self.requested_width,self.requested_height
-        direct_ok = w >= int(req_w*0.80) and h >= int(req_h*0.80)
-        swapped_ok = h >= int(req_w*0.80) and w >= int(req_h*0.80)
-        resolution_ok = bool(direct_ok or swapped_ok)
-
-        if resolution_ok:
-            resolution_score = 100.0
-        elif w >= 640 and h >= 360:
-            resolution_score = 78.0
-        else:
-            resolution_score = 50.0
-
+        resolution_score = 100.0 if (w >= 960 and h >= 720) else 82.0 if (w >= 640 and h >= 480) else 55.0
         marker_score = 100.0 if self.capture_mode == "Visão normal" or marker_found else 0.0
 
         quality = (
@@ -1658,7 +1626,6 @@ class ErgonomiaVideoProcessor:
             "brightness":brightness,
             "blur_score":blur_score,
             "resolution":f"{w}x{h}",
-            "resolution_ok":resolution_ok,
         }
 
     def _blur_face_region(self, image, lm):
@@ -1712,15 +1679,15 @@ class ErgonomiaVideoProcessor:
     def _overlay(self, image, values):
         h,w=image.shape[:2]
         overlay=image.copy()
-        cv2.rectangle(overlay,(12,12),(min(610,w-12),318),(8,18,31),-1)
+        cv2.rectangle(overlay,(12,12),(min(530,w-12),310),(8,18,31),-1)
         cv2.addWeighted(overlay,.84,image,.16,0,image)
 
         if values.get("valid_frame"):
             status_color=(90,230,150)
-            status="FRAME VALIDO"
+            status="FRAME VÁLIDO"
         else:
             status_color=(70,70,255)
-            status="MEDICAO PAUSADA"
+            status="MEDIÇÃO PAUSADA"
 
         cv2.putText(image,status,(28,42),cv2.FONT_HERSHEY_SIMPLEX,.65,status_color,2,cv2.LINE_AA)
         cv2.putText(
@@ -1730,13 +1697,8 @@ class ErgonomiaVideoProcessor:
         )
         cv2.putText(
             image,
-            f"Captura {values.get('resolution','--')} | IA {values.get('processing_resolution','--')} | {self.camera_label}",
-            (28,90),cv2.FONT_HERSHEY_SIMPLEX,.40,(175,210,235),1,cv2.LINE_AA
-        )
-        cv2.putText(
-            image,
             f"IRE {values.get('ire',0)} | RULA {values.get('rula',0)}/7 | REBA {values.get('reba',0)}/15",
-            (28,118),cv2.FONT_HERSHEY_SIMPLEX,.62,(100,230,255),2,cv2.LINE_AA
+            (28,98),cv2.FONT_HERSHEY_SIMPLEX,.62,(100,230,255),2,cv2.LINE_AA
         )
 
         lines=[
@@ -1747,19 +1709,19 @@ class ErgonomiaVideoProcessor:
             f"Punho E/D*: {fmt_angle(values.get('wrist_l'))} / {fmt_angle(values.get('wrist_r'))}",
             f"Joelho E/D: {fmt_angle(values.get('knee_l'))} / {fmt_angle(values.get('knee_r'))}",
         ]
-        y=148
+        y=130
         for line in lines:
-            cv2.putText(image,line,(28,y),cv2.FONT_HERSHEY_SIMPLEX,.46,(238,244,250),1,cv2.LINE_AA)
-            y += 22
+            cv2.putText(image,line,(28,y),cv2.FONT_HERSHEY_SIMPLEX,.47,(238,244,250),1,cv2.LINE_AA)
+            y += 24
 
         marker_txt = (
             f"ArUco ID {self.marker_id}: {'OK' if values.get('marker_found') else 'NAO ENCONTRADO'}"
             if self.capture_mode != "Visão normal"
-            else "Modo: visao sem marcador"
+            else "Modo: visão sem marcador"
         )
-        cv2.putText(image,marker_txt,(28,286),cv2.FONT_HERSHEY_SIMPLEX,.42,(190,215,235),1,cv2.LINE_AA)
+        cv2.putText(image,marker_txt,(28,282),cv2.FONT_HERSHEY_SIMPLEX,.43,(190,215,235),1,cv2.LINE_AA)
         if values.get("flags"):
-            cv2.putText(image," | ".join(values["flags"]),(28,307),cv2.FONT_HERSHEY_SIMPLEX,.39,(80,205,255),1,cv2.LINE_AA)
+            cv2.putText(image," | ".join(values["flags"]),(28,304),cv2.FONT_HERSHEY_SIMPLEX,.40,(80,205,255),1,cv2.LINE_AA)
 
     def _capture_evidence(self, image, factor, value, values, now):
         state=self.factor_state[factor]
@@ -1866,8 +1828,6 @@ class ErgonomiaVideoProcessor:
 
     def recv(self, frame):
         image=frame.to_ndarray(format="bgr24")
-        original_h,original_w=image.shape[:2]
-
         now=time.monotonic()
         raw_dt=now-self.last_tick
         dt=clamp(raw_dt,0.0,0.25)
@@ -1880,50 +1840,28 @@ class ErgonomiaVideoProcessor:
             ts=self.last_timestamp_ms+1
         self.last_timestamp_ms=ts
 
-        # ArUco só é procurado quando o modo de marcador está realmente em uso.
-        corners,ids=[],None
+        gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+        corners,ids=self._marker_detection(gray)
         marker_found=False
         marker_center_norm=None
         marker_count=0
-        if self.capture_mode != "Visão normal":
-            gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
-            corners,ids=self._marker_detection(gray)
-            if ids is not None:
-                flat_ids=[int(x) for x in np.asarray(ids).flatten().tolist()]
-                marker_count=len(flat_ids)
-                if self.marker_id in flat_ids:
-                    marker_found=True
-                    idx=flat_ids.index(self.marker_id)
-                    c=np.asarray(corners[idx]).reshape(-1,2)
-                    cx,cy=np.mean(c,axis=0)
-                    marker_center_norm=np.array([cx/original_w,cy/original_h],dtype=np.float32)
+        if ids is not None:
+            flat_ids=[int(x) for x in np.asarray(ids).flatten().tolist()]
+            marker_count=len(flat_ids)
+            if self.marker_id in flat_ids:
+                marker_found=True
+                idx=flat_ids.index(self.marker_id)
+                c=np.asarray(corners[idx]).reshape(-1,2)
+                cx,cy=np.mean(c,axis=0)
+                h,w=image.shape[:2]
+                marker_center_norm=np.array([cx/w,cy/h],dtype=np.float32)
 
-        # O frame que volta ao tablet e as evidências permanecem na resolução original.
-        # Somente a imagem enviada ao MediaPipe é reduzida.
-        process_image=image
-        long_side=max(original_h,original_w)
-        if long_side > self.process_long_side:
-            scale=self.process_long_side/float(long_side)
-            process_w=max(2,int(round(original_w*scale)))
-            process_h=max(2,int(round(original_h*scale)))
-            process_image=cv2.resize(image,(process_w,process_h),interpolation=cv2.INTER_AREA)
-        else:
-            process_h,process_w=original_h,original_w
-
-        rgb=cv2.cvtColor(process_image,cv2.COLOR_BGR2RGB)
+        rgb=cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
         mp_image=mp.Image(image_format=mp.ImageFormat.SRGB,data=rgb)
         try:
             result=self.landmarker.detect_for_video(mp_image,ts)
         except Exception:
             result=None
-
-        req_w,req_h=self.requested_width,self.requested_height
-        direct_ok=original_w>=int(req_w*0.80) and original_h>=int(req_h*0.80)
-        swapped_ok=original_h>=int(req_w*0.80) and original_w>=int(req_h*0.80)
-        resolution_ok=bool(direct_ok or swapped_ok)
-        orientation="Paisagem" if original_w>=original_h else "Retrato"
-        requested_resolution=f"{req_w}x{req_h}"
-        processing_resolution=f"{process_w}x{process_h}"
 
         poses=result.pose_landmarks if result and result.pose_landmarks else []
         lm=self._select_pose(poses,marker_center_norm if marker_found else None)
@@ -1936,19 +1874,12 @@ class ErgonomiaVideoProcessor:
                     "pose_found":False,"valid_frame":False,"quality":0.0,
                     "risk":"SEM LEITURA","flags":[],"fps":self.fps_ema,
                     "marker_found":marker_found,"marker_count":marker_count,
-                    "resolution":f"{original_w}x{original_h}",
-                    "processing_resolution":processing_resolution,
-                    "requested_resolution":requested_resolution,
-                    "resolution_ok":resolution_ok,
-                    "orientation":orientation,
-                    "camera_label":self.camera_label,
+                    "resolution":f"{image.shape[1]}x{image.shape[0]}",
                 })
             self._draw_markers(image,corners,ids)
-            cv2.rectangle(image,(15,15),(min(650,original_w-15),82),(20,20,20),-1)
+            cv2.rectangle(image,(15,15),(570,76),(20,20,20),-1)
             cv2.putText(image,"Corpo nao detectado - medicao pausada",(28,53),
                         cv2.FONT_HERSHEY_SIMPLEX,.65,(255,255,255),2,cv2.LINE_AA)
-            cv2.putText(image,f"Captura {original_w}x{original_h} | IA {processing_resolution}",
-                        (28,74),cv2.FONT_HERSHEY_SIMPLEX,.40,(190,215,235),1,cv2.LINE_AA)
             return av.VideoFrame.from_ndarray(image,format="bgr24")
 
         quality=self._capture_quality(image,lm,marker_found)
@@ -1996,11 +1927,6 @@ class ErgonomiaVideoProcessor:
             "quality":quality["quality"],"coverage":quality["coverage"],
             "brightness":quality["brightness"],"blur_score":quality["blur_score"],
             "resolution":quality["resolution"],"fps":self.fps_ema,
-            "processing_resolution":processing_resolution,
-            "requested_resolution":requested_resolution,
-            "resolution_ok":quality.get("resolution_ok",resolution_ok),
-            "orientation":orientation,
-            "camera_label":self.camera_label,
             "marker_found":marker_found,"marker_count":marker_count,
         }
         values["ire"]=calc_ire(values,self.cfg) if valid_frame else 0
@@ -2012,8 +1938,7 @@ class ErgonomiaVideoProcessor:
             values["rula"]=int(rr.get("score",0))
             values["reba"]=int(rb.get("score",0))
         except Exception:
-            values["rula"]=0
-            values["reba"]=0
+            values["rula"]=0; values["reba"]=0
 
         # Privacidade: detectar primeiro, desfocar depois.
         self._blur_face_region(image,lm)
@@ -2075,7 +2000,6 @@ class ErgonomiaVideoProcessor:
                     self.time_series=self.time_series[-7200:]
 
             active_map={"TRONCO":trunk_flag,"PESCOCO":neck_flag,"BRACO":arm_flag,"JOELHO":knee_flag}
-            # A evidência é salva do frame original recebido, não da cópia reduzida da IA.
             self._process_evidence(image,active_map,values,now)
 
         return av.VideoFrame.from_ndarray(image,format="bgr24")
@@ -2092,7 +2016,7 @@ class ErgonomiaVideoProcessor:
 # ============================================================
 st.set_page_config(
     page_title=APP_TITLE, page_icon="🧍", layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
@@ -2144,38 +2068,7 @@ div[data-testid="stMetricValue"]{font-weight:850}
 .heat{border:1px solid rgba(120,180,220,.14);border-radius:13px;padding:12px;background:rgba(20,40,60,.55)}
 .heatname{font-weight:800}.heatpct{font-size:1.45rem;font-weight:900;margin-top:4px}
 .small-muted{font-size:.77rem;color:#91a9bf}
-.camera-spec{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 10px}
-.camera-spec>div{border:1px solid rgba(115,190,230,.16);border-radius:12px;padding:9px 11px;background:rgba(12,28,46,.72)}
-.camera-spec .c-label{font-size:.62rem;color:#819ab2;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
-.camera-spec .c-value{font-size:.88rem;color:#eff6ff;font-weight:850;margin-top:4px}
-
-/* O vídeo WebRTC deve usar toda a largura disponível, sem crop. */
-video{
- width:100%!important;
- height:auto!important;
- max-height:72vh!important;
- object-fit:contain!important;
- background:#020812!important;
- border-radius:15px!important;
-}
-
-@media(max-width:1100px){
- .block-container{padding-top:.7rem;padding-left:.75rem;padding-right:.75rem}
- .title{font-size:1.45rem}
- .subtitle{font-size:.84rem;margin-bottom:10px}
- .info-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
- .info{min-height:62px;padding:9px 10px}
- .panel{padding:11px 12px}
- .camera-spec{grid-template-columns:repeat(3,minmax(0,1fr))}
- video{max-height:62vh!important}
-}
-@media(max-width:650px){
- .camera-spec{grid-template-columns:1fr}
- .info-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
- .title{font-size:1.25rem}
- .logo{width:42px;height:42px}
- video{max-height:58vh!important}
-}
+@media(max-width:1000px){.info-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -2207,30 +2100,9 @@ with st.sidebar:
     st.markdown("### Captura")
     capture_mode=st.radio("Modo",["Visão normal","Visão + marcador ArUco"],index=0)
     marker_id=st.number_input("ID ArUco do colaborador",min_value=0,max_value=49,value=0,step=1,disabled=capture_mode=="Visão normal")
-
-    camera_facing=st.selectbox(
-        "Câmera preferida",
-        ["Traseira principal","Frontal"],
-        index=0,
-        help="No tablet, a traseira principal é a opção recomendada. Evite ultrawide para medição angular."
-    )
-    camera_profile_name=st.selectbox(
-        "Qualidade da câmera",
-        list(CAMERA_PROFILES.keys()),
-        index=0,
-        help="Industrial 720p é o padrão recomendado. 1080p usa 24 FPS para reduzir compressão e carga."
-    )
-    camera_profile=CAMERA_PROFILES[camera_profile_name]
-    layout_mode=st.radio("Layout",["Tablet / celular","Desktop"],index=0,horizontal=True)
-
     min_quality=st.slider("Qualidade mínima para contabilizar frame",40,95,70,1,format="%d%%")
     blur_face=st.checkbox("Desfocar rosto nas evidências",value=True)
-    st.caption(
-        "Use o tablet em paisagem. A captura fica em alta resolução; "
-        "a IA analisa uma cópia menor para manter fluidez."
-    )
-    if capture_mode!="Visão normal":
-        st.caption("No modo ArUco, frames sem o marcador alvo são descartados.")
+    st.caption("No modo ArUco, frames sem o marcador alvo são descartados.")
 
     st.markdown("### Limiares do IRE")
     trunk_limit=st.slider("Tronco",10,60,25,1,format="%d°")
@@ -2294,35 +2166,6 @@ cfg={
     "capture_mode":capture_mode,"marker_id":int(marker_id),
     "min_quality":float(min_quality),"blur_face":blur_face,
     "rula_opts":rula_opts_live,"reba_opts":reba_opts_live,
-    "process_long_side":int(camera_profile["process_long_side"]),
-    "requested_width":int(camera_profile["width"]),
-    "requested_height":int(camera_profile["height"]),
-    "requested_fps":int(camera_profile["fps"]),
-    "camera_label":camera_facing,
-}
-
-camera_facing_mode="environment" if camera_facing=="Traseira principal" else "user"
-camera_constraints={
-    "video":{
-        "facingMode":{"ideal":camera_facing_mode},
-        "width":{
-            "min":640,
-            "ideal":int(camera_profile["width"]),
-            "max":int(camera_profile["width"]),
-        },
-        "height":{
-            "min":360,
-            "ideal":int(camera_profile["height"]),
-            "max":int(camera_profile["height"]),
-        },
-        "aspectRatio":{"ideal":16/9},
-        "frameRate":{
-            "min":20,
-            "ideal":int(camera_profile["fps"]),
-            "max":int(camera_profile["fps"]),
-        },
-    },
-    "audio":False,
 }
 
 ok,err=ensure_model()
@@ -2346,7 +2189,7 @@ st.markdown(f"""
  <div class="info"><div class="lbl">Operação / Posto</div><div class="val">{safe(st.session_state.operacao)}</div></div>
  <div class="info"><div class="lbl">Colaborador</div><div class="val">{safe(st.session_state.colaborador)}</div></div>
  <div class="info"><div class="lbl">Turno</div><div class="val">{safe(st.session_state.turno)}</div></div>
- <div class="info"><div class="lbl">Captura</div><div class="val">{safe(camera_profile_name)}</div></div>
+ <div class="info"><div class="lbl">Captura</div><div class="val">{safe(capture_mode)}</div></div>
 </div>
 """,unsafe_allow_html=True)
 
@@ -2365,161 +2208,114 @@ tab_live,tab_cycles,tab_methods,tab_evidence,tab_actions,tab_history,tab_finish=
 # ACOMPANHAMENTO
 # ------------------------------------------------------------
 with tab_live:
-    def render_camera_block():
+    col_cam,col_data=st.columns([1.48,1.0],gap="large")
+    with col_cam:
         st.markdown("""
         <div class="panel"><div class="panel-title">Monitoramento biomecânico</div>
-        <div class="panel-sub">Captura otimizada para tablet. Evidências permanecem na resolução recebida; o MediaPipe usa uma cópia reduzida.</div></div>
+        <div class="panel-sub">Somente frames com qualidade suficiente entram nos indicadores. Evidências são salvas automaticamente por fator.</div></div>
         """,unsafe_allow_html=True)
 
-        st.markdown(
-            f"""
-            <div class="camera-spec">
-              <div><div class="c-label">Câmera preferida</div><div class="c-value">{safe(camera_facing)}</div></div>
-              <div><div class="c-label">Solicitado</div><div class="c-value">{camera_profile['width']}×{camera_profile['height']} · {camera_profile['fps']} FPS</div></div>
-              <div><div class="c-label">IA</div><div class="c-value">lado máx. {camera_profile['process_long_side']} px</div></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        ctx_local=webrtc_streamer(
+        ctx=webrtc_streamer(
             key=f"nr17-v4-{st.session_state.assessment_id}",
             mode=WebRtcMode.SENDRECV,
             video_processor_factory=lambda:ErgonomiaVideoProcessor(cfg),
-            media_stream_constraints=camera_constraints,
+            media_stream_constraints={
+                "video":{
+                    "width":{"min":1280,"ideal":1920,"max":1920},
+                    "height":{"min":720,"ideal":1080,"max":1080},
+                    "frameRate":{"ideal":30,"max":30},
+                    "facingMode":{"ideal":"environment"},
+                },
+                "audio":False,
+            },
             async_processing=True,
         )
 
-        # 2×2 fica muito mais utilizável em tablet do que quatro botões estreitos.
-        b1,b2=st.columns(2)
+        b1,b2,b3,b4=st.columns(4)
         with b1:
             if st.button("↺ Zerar",use_container_width=True):
-                if ctx_local.video_processor:
-                    ctx_local.video_processor.reset(clear_files=True)
+                if ctx.video_processor:
+                    ctx.video_processor.reset(clear_files=True)
                     st.session_state.captured_pose=None
                     st.success("Medição zerada.")
         with b2:
             if st.button("◎ Referência",use_container_width=True):
-                if ctx_local.video_processor:
-                    snap=ctx_local.video_processor.snapshot()
+                if ctx.video_processor:
+                    snap=ctx.video_processor.snapshot()
                     if snap.get("valid_frame"):
                         st.session_state.captured_pose=snap
                         st.success("Postura marcada.")
                     else:
                         st.warning("Aguarde um frame válido.")
-
-        b3,b4=st.columns(2)
         with b3:
             if st.button("▶ Ciclo",use_container_width=True):
-                if ctx_local.video_processor:
-                    okc,msg=ctx_local.video_processor.start_cycle()
+                if ctx.video_processor:
+                    okc,msg=ctx.video_processor.start_cycle()
                     (st.success if okc else st.warning)(msg)
         with b4:
             if st.button("■ Fechar ciclo",use_container_width=True):
-                if ctx_local.video_processor:
-                    okc,msg=ctx_local.video_processor.finish_cycle()
+                if ctx.video_processor:
+                    okc,msg=ctx.video_processor.finish_cycle()
                     (st.success if okc else st.warning)(msg)
 
-        st.caption(
-            "Se alterar câmera, resolução, modo de captura, limiares ou fatores RULA/REBA, "
-            "pare e inicie novamente a câmera para aplicar as novas configurações."
-        )
-        return ctx_local
+        st.caption("Ao alterar modo de captura, limiares ou fatores RULA/REBA, reinicie a câmera para aplicar os novos parâmetros ao processamento frame a frame.")
 
-    if layout_mode=="Desktop":
-        col_cam,col_data=st.columns([1.48,1.0],gap="large")
-        with col_cam:
-            ctx=render_camera_block()
-        live_target=col_data
-    else:
-        # No tablet a câmera fica em cima e os indicadores abaixo.
-        ctx=render_camera_block()
-        live_target=None
+    with col_data:
+        @st.fragment(run_every=1.0)
+        def live_panel():
+            proc=ctx.video_processor
+            if proc is None:
+                st.info("Clique em START para iniciar.")
+                return
+            s=proc.snapshot()
 
-    @st.fragment(run_every=1.0)
-    def live_panel():
-        proc=ctx.video_processor
-        if proc is None:
-            st.info("Clique em START para iniciar.")
-            return
-        s=proc.snapshot()
-
-        q=float(s.get("quality",0))
-        actual=s.get("resolution","--")
-        requested=s.get("requested_resolution",f"{camera_profile['width']}x{camera_profile['height']}")
-        processing=s.get("processing_resolution","--")
-        orientation=s.get("orientation","--")
-
-        st.markdown(
-            f"""<div class="quality-card">
-            <div class="small-muted">QUALIDADE DA CAPTURA</div>
-            <div style="font-size:1.8rem;font-weight:900;color:{_quality_color(q)}">{q:.0f}% · {_quality_label(q)}</div>
-            <div class="small-muted">
-                recebida {actual} · solicitada {requested} · IA {processing}<br>
-                {s.get('fps',0):.1f} FPS · cobertura {s.get('coverage',0):.0f}% · {safe(orientation)}
-            </div>
-            </div>""",unsafe_allow_html=True
-        )
-
-        if actual!="--" and not s.get("resolution_ok",False):
-            st.warning(
-                f"O navegador entregou {actual}, abaixo do perfil {requested}. "
-                "Confirme câmera traseira principal, use o tablet em paisagem e verifique a qualidade do Wi-Fi."
+            q=float(s.get("quality",0))
+            st.markdown(
+                f"""<div class="quality-card">
+                <div class="small-muted">QUALIDADE DA CAPTURA</div>
+                <div style="font-size:1.8rem;font-weight:900;color:{_quality_color(q)}">{q:.0f}% · {_quality_label(q)}</div>
+                <div class="small-muted">{s.get('resolution','--')} · {s.get('fps',0):.1f} FPS · cobertura {s.get('coverage',0):.0f}%</div>
+                </div>""",unsafe_allow_html=True
             )
-        elif orientation=="Retrato":
-            st.warning("Gire o tablet para paisagem para melhorar o enquadramento biomecânico.")
+            if not s.get("valid_frame"):
+                msg="Frame descartado: ajuste enquadramento/iluminação"
+                if capture_mode!="Visão normal" and not s.get("marker_found"):
+                    msg=f"Frame descartado: ArUco ID {marker_id} não encontrado"
+                st.error(msg)
+            else:
+                st.success("Frame válido — contabilizando exposição.")
 
-        if s.get("fps",0) and s.get("fps",0)<18:
-            st.warning(
-                f"FPS baixo ({s.get('fps',0):.1f}). Se a imagem estiver travando, use o perfil Industrial 720p "
-                "ou Econômico 540p."
+            a,b,c=st.columns(3)
+            a.metric("IRE atual",f"{s.get('ire',0)}/100")
+            b.metric("RULA ao vivo",f"{s.get('rula',0)}/7")
+            c.metric("REBA ao vivo",f"{s.get('reba',0)}/15")
+
+            d,e,f=st.columns(3)
+            d.metric("Tempo válido",fmt_seconds(s.get("total_time",0)))
+            e.metric("Exposição",f"{s.get('risk_pct',0):.1f}%")
+            f.metric("Frames válidos",f"{s.get('valid_pct',0):.1f}%")
+
+            st.markdown("#### Exposição corporal")
+            heat=[
+                ("Tronco",s.get("trunk_pct",0)),
+                ("Pescoço",s.get("neck_pct",0)),
+                ("Braço elevado",s.get("arm_pct",0)),
+                ("Joelho",s.get("knee_pct",0)),
+            ]
+            for label,pct in heat:
+                st.caption(f"{label} · {pct:.1f}%")
+                st.progress(clamp(float(pct)/100,0,1))
+
+            x,y=st.columns(2)
+            x.metric("Pior RULA",f"{s.get('max_rula',0)}/7")
+            y.metric("Pior REBA",f"{s.get('max_reba',0)}/15")
+            st.caption(
+                f"RULA predominante {s.get('rula_dominant',0)} · "
+                f"REBA predominante {s.get('reba_dominant',0)} · "
+                f"{len(s.get('evidence',[]))} evidência(s)"
             )
-
-        if not s.get("valid_frame"):
-            msg="Frame descartado: ajuste enquadramento/iluminação"
-            if capture_mode!="Visão normal" and not s.get("marker_found"):
-                msg=f"Frame descartado: ArUco ID {marker_id} não encontrado"
-            st.error(msg)
-        else:
-            st.success("Frame válido — contabilizando exposição.")
-
-        a,b,c=st.columns(3)
-        a.metric("IRE atual",f"{s.get('ire',0)}/100")
-        b.metric("RULA ao vivo",f"{s.get('rula',0)}/7")
-        c.metric("REBA ao vivo",f"{s.get('reba',0)}/15")
-
-        d,e,f=st.columns(3)
-        d.metric("Tempo válido",fmt_seconds(s.get("total_time",0)))
-        e.metric("Exposição",f"{s.get('risk_pct',0):.1f}%")
-        f.metric("Frames válidos",f"{s.get('valid_pct',0):.1f}%")
-
-        st.markdown("#### Exposição corporal")
-        heat=[
-            ("Tronco",s.get("trunk_pct",0)),
-            ("Pescoço",s.get("neck_pct",0)),
-            ("Braço elevado",s.get("arm_pct",0)),
-            ("Joelho",s.get("knee_pct",0)),
-        ]
-        for label,pct in heat:
-            st.caption(f"{label} · {pct:.1f}%")
-            st.progress(clamp(float(pct)/100,0,1))
-
-        x,y=st.columns(2)
-        x.metric("Pior RULA",f"{s.get('max_rula',0)}/7")
-        y.metric("Pior REBA",f"{s.get('max_reba',0)}/15")
-        st.caption(
-            f"RULA predominante {s.get('rula_dominant',0)} · "
-            f"REBA predominante {s.get('reba_dominant',0)} · "
-            f"{len(s.get('evidence',[]))} evidência(s)"
-        )
-        if s.get("cycle_active"):
-            st.warning("CICLO EM ANDAMENTO")
-
-    if live_target is not None:
-        with live_target:
-            live_panel()
-    else:
-        st.markdown("### Indicadores ao vivo")
+            if s.get("cycle_active"):
+                st.warning("CICLO EM ANDAMENTO")
         live_panel()
 
 # ------------------------------------------------------------
