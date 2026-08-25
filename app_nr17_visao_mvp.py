@@ -1828,6 +1828,13 @@ class ErgonomiaVideoProcessor:
 
     def recv(self, frame):
         image=frame.to_ndarray(format="bgr24")
+
+        # Redução de ruído (grão/chuvisco de baixa luz). bilateralFilter
+        # suaviza o ruído do sensor preservando bordas melhor que um
+        # blur comum, e é rápido o suficiente para tempo real. Roda no
+        # servidor (não no tablet), então não pesa na CPU do dispositivo.
+        image=cv2.bilateralFilter(image,d=5,sigmaColor=45,sigmaSpace=45)
+
         now=time.monotonic()
         raw_dt=now-self.last_tick
         dt=clamp(raw_dt,0.0,0.25)
@@ -2221,10 +2228,18 @@ with tab_live:
             video_processor_factory=lambda:ErgonomiaVideoProcessor(cfg),
             media_stream_constraints={
                 "video":{
-                    "width":{"min":1280,"ideal":1920,"max":1920},
-                    "height":{"min":720,"ideal":1080,"max":1080},
-                    "frameRate":{"ideal":30,"max":30},
+                    "width":{"min":960,"ideal":1280,"max":1280},
+                    "height":{"min":540,"ideal":720,"max":720},
+                    # FPS mais baixo = a câmera pode usar um tempo de
+                    # exposição maior por frame em vez de "empurrar" o
+                    # ganho/ISO lá em cima. Isso reduz bastante o ruído
+                    # granulado em ambientes escuros.
+                    "frameRate":{"ideal":15,"max":20},
                     "facingMode":{"ideal":"environment"},
+                    # Tenta ligar a lanterna/flash traseiro do tablet
+                    # como luz de apoio (suportado em parte dos
+                    # Android/Chrome; se não suportado, é ignorado).
+                    "advanced":[{"torch":True}],
                 },
                 "audio":False,
             },
