@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencv-contrib-python"
+version = "4.14.0.94"
+description = "Dependency shim for MediaPipe on headless Streamlit Community Cloud"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+py-modules = []
