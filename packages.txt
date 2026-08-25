@@ -1,2 +1,1 @@
 libgthread-2.0
-libGLESv2
