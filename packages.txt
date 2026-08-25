@@ -1,1 +1,2 @@
-libgthread-2.0
+libgles2
+libegl1
